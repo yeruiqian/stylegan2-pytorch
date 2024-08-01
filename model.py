@@ -23,10 +23,19 @@ def make_kernel(k):
     k = torch.tensor(k, dtype=torch.float32)
 
     if k.ndim == 1:
-        k = k[None, :] * k[:, None]
+        k = k[None, :] * k[:, None] 
+        # tensor([[1., 3., 3., 1.],
+        # [3., 9., 9., 3.],
+        # [3., 9., 9., 3.],
+        # [1., 3., 3., 1.]])#
+        
 
     k /= k.sum()
 
+    # tensor([[0.0156, 0.0469, 0.0469, 0.0156],
+    #     [0.0469, 0.1406, 0.1406, 0.0469],
+    #     [0.0469, 0.1406, 0.1406, 0.0469],
+    #     [0.0156, 0.0469, 0.0469, 0.0156]])
     return k
 
 
@@ -76,7 +85,7 @@ class Blur(nn.Module):
     def __init__(self, kernel, pad, upsample_factor=1):
         super().__init__()
 
-        kernel = make_kernel(kernel)
+        kernel = make_kernel(kernel) #4x4
 
         if upsample_factor > 1:
             kernel = kernel * (upsample_factor ** 2)
@@ -167,6 +176,10 @@ class EqualLinear(nn.Module):
 
 
 class ModulatedConv2d(nn.Module):
+    """
+    神奇的调制卷积，看着很多很唬人
+
+    """
     def __init__(
         self,
         in_channel,
@@ -198,14 +211,13 @@ class ModulatedConv2d(nn.Module):
 
         if downsample:
             factor = 2
-            p = (len(blur_kernel) - factor) + (kernel_size - 1)
-            pad0 = (p + 1) // 2
-            pad1 = p // 2
-
+            p = (len(blur_kernel) - factor) + (kernel_size - 1) #4
+            pad0 = (p + 1) // 2 #2
+            pad1 = p // 2 #2
             self.blur = Blur(blur_kernel, pad=(pad0, pad1))
 
-        fan_in = in_channel * kernel_size ** 2
-        self.scale = 1 / math.sqrt(fan_in)
+        fan_in = in_channel * kernel_size ** 2 #以通道512为例子 ， 512x3x3
+        self.scale = 1 / math.sqrt(fan_in) # 1/sqrt(512*3*3) =0.014 ,目的是啥？归一化？大通道放大倍数小，少通道放大倍数大？
         self.padding = kernel_size // 2
 
         self.weight = nn.Parameter(
@@ -226,6 +238,7 @@ class ModulatedConv2d(nn.Module):
     def forward(self, input, style):
         batch, in_channel, height, width = input.shape
 
+        # 训练默认不进入这一堆东西
         if not self.fused:
             weight = self.scale * self.weight.squeeze(0)
             style = self.modulation(style)
@@ -255,11 +268,17 @@ class ModulatedConv2d(nn.Module):
 
             return out
 
+        # style通过线性层转为当前尺度的通道数，调制？
         style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
+
+        # 权重缩放并*style 维度 B,out,in,k,k
         weight = self.scale * self.weight * style
 
+        # 解调
         if self.demodulate:
+            # 平方和，开根号并导数，维度 B,out，又合起来了。。什么神仙操作。。
             demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
+            # demod只有B,out,1,1,1维度，和weight相乘变成B,out,in,k,k
             weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
 
         weight = weight.view(
@@ -292,10 +311,14 @@ class ModulatedConv2d(nn.Module):
             out = out.view(batch, self.out_channel, height, width)
 
         else:
+            # 将输入拉成1，B*C,H,W，当作单batch的卷积，为了加速么？
             input = input.view(1, batch * in_channel, height, width)
+            # g= batch，所以其实每个batch还是单独做的卷积
+            # 权重维度是B*out,in,k,k ，就是分组卷积的权重形式
             out = conv2d_gradfix.conv2d(
                 input, weight, padding=self.padding, groups=batch
             )
+            # 卷积完的维度是1,B*out,H,W
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
 
@@ -306,11 +329,13 @@ class NoiseInjection(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # 权重初始化0
         self.weight = nn.Parameter(torch.zeros(1))
 
     def forward(self, image, noise=None):
-        if noise is None:
+        if noise is None: # 训练满足的条件
             batch, _, height, width = image.shape
+            # 生成随机噪声
             noise = image.new_empty(batch, 1, height, width).normal_()
 
         return image + self.weight * noise
@@ -330,6 +355,16 @@ class ConstantInput(nn.Module):
 
 
 class StyledConv(nn.Module):
+    """
+    可怕的styleconv
+    训练时 noise都是None
+
+    1、调制卷积self.conv，输入input和style，
+    input是上一层的输出，往下传递
+    style是原始随机数，经过线性层变成style，在扩展为N为的lantent隐码，每一个隐码就是一个style
+    2、self.noise 噪声注入模块
+    3、self.activate激活函数
+    """
     def __init__(
         self,
         in_channel,
@@ -404,7 +439,20 @@ class Generator(nn.Module):
 
         self.style_dim = style_dim
 
+        # 归一化 x * rsqrt(x*x.mean+1e-8)
         layers = [PixelNorm()]
+
+        # 映射层 512 -> 512 ,
+        # lr_mlp 是学习率乘法因子，
+        """
+        权重初始化torch.randn(out_dim, in_dim).div_(lr_mul)，除以小于1的数，放大了
+        偏置初始化0，
+
+        权重乘以这个 self.scale = (1 / math.sqrt(in_dim)) * lr_mul ， 实际上两者结合就是*(1 / math.sqrt(in_dim))
+
+        偏置乘以这个 self.lr_mul 
+
+        """
 
         for i in range(n_mlp):
             layers.append(
@@ -412,7 +460,10 @@ class Generator(nn.Module):
                     style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
                 )
             )
-
+        """
+        style 将输入b in_dim -> b in_dim 线性或非线性映射(存在激活函数)，dim一般=512
+        
+        """
         self.style = nn.Sequential(*layers)
 
         self.channels = {
@@ -426,14 +477,32 @@ class Generator(nn.Module):
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
         }
+        """ 初始化输入
+           self.channels[4]=512,初始化得到(1,512,4,4)
+           第一维度 repeat batch次 变成(b,512,4,4) 
 
+        """
         self.input = ConstantInput(self.channels[4])
+
+        """
+        开始设置卷积了，在外部当作普通卷积理解，具体理解可见具体函数
+        输入输出通道都是512，没有上采样
+        """
         self.conv1 = StyledConv(
             self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
         )
+        """
+        先当作普通卷积，从512通道卷积到3通道(RGB)
+        b,512,4,4 -> b,3,4,4
+        """
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
 
+        # 2^n 次方，如果是512，logsize就是9
         self.log_size = int(math.log(size, 2))
+        """
+        # 层数根据logsize来设置如果是512，那么就是(9-2)*2+1 = 15 层，
+        初始尺寸4，是2^2 ，最终尺寸是2^9，除去第一个尺寸的一个卷积，其他每个尺寸都有两个卷积=(9-2)*2+1
+        """
         self.num_layers = (self.log_size - 2) * 2 + 1
 
         self.convs = nn.ModuleList()
@@ -443,11 +512,21 @@ class Generator(nn.Module):
 
         in_channel = self.channels[4]
 
+        """
+        为啥+5？ 与每个尺寸的操作对应，第一个卷积只有一个，噪声也只有一个，都是在尺寸4上进行
+        从第二个卷积开始，每个卷积都有两个，噪声也有两个，+5可以保证下一个偶数噪声和下下个奇数噪声尺寸相同。
+        """
         for layer_idx in range(self.num_layers):
             res = (layer_idx + 5) // 2
             shape = [1, 1, 2 ** res, 2 ** res]
             self.noises.register_buffer(f"noise_{layer_idx}", torch.randn(*shape))
 
+        """
+        range从3开始到logsize+1，这个主要还是要和out_channel一一对应
+        第一个卷积输入时self.channels[2 ** 2] = self.channels[4] 
+        接下来每一层都是一个卷积(upsample=True) + 一个卷积(upsample=False)
+        且每次上采样都是伴随 2 ** i的改变，也就是通道数会和设定一样，越来越少
+        """
         for i in range(3, self.log_size + 1):
             out_channel = self.channels[2 ** i]
 
@@ -472,6 +551,11 @@ class Generator(nn.Module):
 
             in_channel = out_channel
 
+        """
+        #
+        #   self.n_latent 表示lantent 隐码有几个，是2x9-2=16个
+         也就是总的2^9 ，每个维度有两个lantent但是2，没有，所以-2
+        """
         self.n_latent = self.log_size * 2 - 2
 
     def make_noise(self):
@@ -506,21 +590,23 @@ class Generator(nn.Module):
         input_is_latent=False,
         noise=None,
         randomize_noise=True,
-    ):
-        if not input_is_latent:
+    ):  
+        # 如果只输入一个随机噪声输入，那么输入就是[b,dim]，style输出也是这个维度
+        if not input_is_latent: # 训练时候满足这个条件
             styles = [self.style(s) for s in styles]
 
         if noise is None:
-            if randomize_noise:
-                noise = [None] * self.num_layers
+            if randomize_noise: #训练时满足
+                noise = [None] * self.num_layers # 都设置为None
             else:
+                # 初始化时候的噪声引入15层
                 noise = [
                     getattr(self.noises, f"noise_{i}") for i in range(self.num_layers)
                 ]
 
-        if truncation < 1:
+        if truncation < 1: # 训练时默认1
             style_t = []
-
+            ## a + t(x-a) 两个latent融合
             for style in styles:
                 style_t.append(
                     truncation_latent + truncation * (style - truncation_latent)
@@ -528,35 +614,43 @@ class Generator(nn.Module):
 
             styles = style_t
 
-        if len(styles) < 2:
-            inject_index = self.n_latent
+        if len(styles) < 2: #只有一个noise的存在没有mix
+            inject_index = self.n_latent # 16
 
-            if styles[0].ndim < 3:
+            if styles[0].ndim < 3: # 满足[b,512]
+                # b,dim 变成 b,inject_index,dim，inject_index=16个，维度：[b,16,512]
                 latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
 
             else:
                 latent = styles[0]
 
-        else:
+        else: # 存在两个noise
             if inject_index is None:
+                # 注入的索引，1到15随机 
                 inject_index = random.randint(1, self.n_latent - 1)
 
+            # 前几个用style0后几个用style1
             latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
+            # 融合的style
             latent = torch.cat([latent, latent2], 1)
 
+        # 只是为了创建b,512,4,4的初始化数值
         out = self.input(latent)
         out = self.conv1(out, latent[:, 0], noise=noise[0])
-
+        # 相同尺寸下的卷积后面都要torgb输出rgb图像
         skip = self.to_rgb1(out, latent[:, 1])
 
         i = 1
+        # 总的历经 9-2 = 7次
+        # lanten其实是复用的，torgb的这一层和下一层输入第一个卷积的是同一个
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
             out = conv1(out, latent[:, i], noise=noise1)
             out = conv2(out, latent[:, i + 1], noise=noise2)
+            # 相同尺寸下的卷积后面都要torgb输出rgb图像，多输出上一尺度的输出rgb图像
             skip = to_rgb(out, latent[:, i + 2], skip)
 
             i += 2
