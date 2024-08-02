@@ -169,6 +169,7 @@ if __name__ == "__main__":
 
     latent_in = latent_mean.detach().clone().unsqueeze(0).repeat(imgs.shape[0], 1)
 
+    # 看需不需要n层用n个lantent，默认不需要
     if args.w_plus:
         latent_in = latent_in.unsqueeze(1).repeat(1, g_ema.n_latent, 1)
 

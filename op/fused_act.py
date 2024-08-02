@@ -91,6 +91,10 @@ class FusedLeakyReLUFunction(Function):
 
 
 class FusedLeakyReLU(nn.Module):
+    """
+    融合激活函数？
+    scale默认 2 ** 0.5，1.414
+    """
     def __init__(self, channel, bias=True, negative_slope=0.2, scale=2 ** 0.5):
         super().__init__()
 

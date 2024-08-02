@@ -69,10 +69,11 @@ def d_logistic_loss(real_pred, fake_pred):
 
 
 def d_r1_loss(real_pred, real_img):
-    with conv2d_gradfix.no_weight_gradients():
+    with conv2d_gradfix.no_weight_gradients(): #禁用卷积层权重的梯度计算。这是因为在计算梯度惩罚项时，我们只关心真实图像的梯度。
         grad_real, = autograd.grad(
             outputs=real_pred.sum(), inputs=real_img, create_graph=True
         )
+    # 目的是让鉴别器梯度不要这么大（应该是为了稳定）
     grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
 
     return grad_penalty
@@ -88,13 +89,16 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
+    # 潜码latent 和 带噪声图像的梯度
     grad, = autograd.grad(
         outputs=(fake_img * noise).sum(), inputs=latents, create_graph=True
     )
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
-
+    
+    # 更新平均路径长度
     path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
 
+    # 路径长度的惩罚
     path_penalty = (path_lengths - path_mean).pow(2).mean()
 
     return path_penalty, path_mean.detach(), path_lengths
@@ -124,14 +128,15 @@ def set_grad_none(model, targets):
 
 
 def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
-    loader = sample_data(loader)
+    loader = sample_data(loader) #设置能随机采样的loader，batch已给定，单GPU默认16
 
-    pbar = range(args.iter)
+    pbar = range(args.iter) #bar 实时显示迭代次数
 
-    if get_rank() == 0:
+    if get_rank() == 0: # 主进程的时候更新状态
         pbar = tqdm(pbar, initial=args.start_iter, dynamic_ncols=True, smoothing=0.01)
 
-    mean_path_length = 0
+    # 一些初始化操作，平均路径长度，loss，路径长度，平均路径长度均值 ##
+    mean_path_length = 0 
 
     d_loss_val = 0
     r1_loss = torch.tensor(0.0, device=device)
@@ -140,7 +145,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     path_lengths = torch.tensor(0.0, device=device)
     mean_path_length_avg = 0
     loss_dict = {}
+    ##
 
+    ## 分布式训练model的设置
     if args.distributed:
         g_module = generator.module
         d_module = discriminator.module
@@ -149,15 +156,19 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_module = generator
         d_module = discriminator
 
-    accum = 0.5 ** (32 / (10 * 1000))
-    ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0
-    r_t_stat = 0
+    # 这个参数好像是用来更新g_ema的，为啥要这个特殊的参数，不懂
+    accum = 0.5 ** (32 / (10 * 1000)) #0.9977
+    ada_aug_p = args.augment_p if args.augment_p > 0 else 0.0 #自适应数据增强概率，这个概率好像是随着迭代次数而上升的。这个可以先不看，是20年新搞出来的
 
-    if args.augment and args.augment_p == 0:
+    r_t_stat = 0 #待确定参数意义
+    
+    if args.augment and args.augment_p == 0: #如果增强概率为0，那么启用自适应数据增强，ada_target 是最终数据增强概率，默认0.6，ada_length是达到目标概率的迭代次数，默认是500k，也就是50w次。update_every这个变量是什么，值得确定
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
+    # n_sample，训练时生成的样本数,latent 隐向量的维度，默认512
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
+    #开始迭代训练
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -165,15 +176,19 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             print("Done!")
 
             break
-
+        
+        # 通过next取下一批数据
         real_img = next(loader)
         real_img = real_img.to(device)
 
+        # 先更新鉴别器
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
+        # 混合噪声（其实是latent code的混合，mixing是概率，默认0.9）
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        fake_img, _ = generator(noise) #生成假图
+
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -184,7 +199,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         fake_pred = discriminator(fake_img)
         real_pred = discriminator(real_img_aug)
-        d_loss = d_logistic_loss(real_pred, fake_pred)
+        d_loss = d_logistic_loss(real_pred, fake_pred) #softplus loss 图像见 https://www.cnblogs.com/emanlee/p/17578823.html
 
         loss_dict["d"] = d_loss
         loss_dict["real_score"] = real_pred.mean()
@@ -198,6 +213,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             ada_aug_p = ada_augment.tune(real_pred)
             r_t_stat = ada_augment.r_t_stat
 
+        # 鉴别器正则化，默认16次迭代进行一次
         d_regularize = i % args.d_reg_every == 0
 
         if d_regularize:
@@ -213,12 +229,15 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             r1_loss = d_r1_loss(real_pred, real_img)
 
             discriminator.zero_grad()
+
+            # r1 损失的权重,按照这个算法应该是 10/2*r1loss*16 =80r1loss
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
 
             d_optim.step()
 
         loss_dict["r1"] = r1_loss
 
+        # 更新生成器
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
@@ -228,6 +247,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
+        # 鉴别器给的 loss,非饱和loss？其实就是gan loss
         fake_pred = discriminator(fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
 
@@ -237,11 +257,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         g_loss.backward()
         g_optim.step()
 
+        # 生成器正则化，默认4次迭代进行一次
         g_regularize = i % args.g_reg_every == 0
 
         if g_regularize:
+            # path_batch_shrink路径长度正则化的批大小减少因子(减少内存消耗) 默认2
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
+            # 返回潜码latents
             fake_img, latents = generator(noise, return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
@@ -249,6 +272,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             )
 
             generator.zero_grad()
+            # 损失权重默认2 * 4 = 8path_loss
             weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
 
             if args.path_batch_shrink:
@@ -258,6 +282,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             g_optim.step()
 
+            # 分布式训练的信息更新
             mean_path_length_avg = (
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
@@ -265,6 +290,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         loss_dict["path"] = path_loss
         loss_dict["path_length"] = path_lengths.mean()
 
+        # 更新g_ema
         accumulate(g_ema, g_module, accum)
 
         loss_reduced = reduce_loss_dict(loss_dict)
@@ -449,6 +475,7 @@ if __name__ == "__main__":
     elif args.arch == 'swagan':
         from swagan import Generator, Discriminator
 
+    # 默认latent维度512 ， mlp8个， multiplier = 2
     generator = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
     ).to(device)
@@ -461,9 +488,9 @@ if __name__ == "__main__":
     g_ema.eval()
     accumulate(g_ema, generator, 0)
 
-    g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
-    d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
-
+    g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1) # 4/5 = 0.8
+    d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1) # 16/17 = 0.94
+    # lr = 0.02
     g_optim = optim.Adam(
         generator.parameters(),
         lr=args.lr * g_reg_ratio,
@@ -508,7 +535,7 @@ if __name__ == "__main__":
             output_device=args.local_rank,
             broadcast_buffers=False,
         )
-
+    # 随机水平翻转，归一化
     transform = transforms.Compose(
         [
             transforms.RandomHorizontalFlip(),
