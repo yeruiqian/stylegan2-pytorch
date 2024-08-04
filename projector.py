@@ -154,8 +154,9 @@ if __name__ == "__main__":
     with torch.no_grad():
         noise_sample = torch.randn(n_mean_latent, 512, device=device)
         latent_out = g_ema.style(noise_sample)
-
+        # 10000次随机数经过mapping network得到的平均w
         latent_mean = latent_out.mean(0)
+        # 标准差作为w的尺度(scale)
         latent_std = ((latent_out - latent_mean).pow(2).sum() / n_mean_latent) ** 0.5
 
     percept = lpips.PerceptualLoss(

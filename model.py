@@ -268,7 +268,7 @@ class ModulatedConv2d(nn.Module):
 
             return out
 
-        # style通过线性层转为当前尺度的通道数，调制？
+        # style通过线性层转为当前尺度的通道数
         style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
 
         # 权重缩放并*style 维度 B,out,in,k,k
@@ -439,32 +439,37 @@ class Generator(nn.Module):
 
         self.style_dim = style_dim
 
-        # 归一化 x * rsqrt(x*x.mean+1e-8)
+  
+        """
+        归一化： x * rsqrt(x*x.mean+1e-8)
+        """
         layers = [PixelNorm()]
 
-        # 映射层 512 -> 512 ,
-        # lr_mlp 是学习率乘法因子，
+        
         """
+        映射层： 512 -> 512 ,
+        lr_mlp 是学习率乘法因子，
+
         权重初始化torch.randn(out_dim, in_dim).div_(lr_mul)，除以小于1的数，放大了
         偏置初始化0，
 
         权重乘以这个 self.scale = (1 / math.sqrt(in_dim)) * lr_mul ， 实际上两者结合就是*(1 / math.sqrt(in_dim))
-
         偏置乘以这个 self.lr_mul 
-
         """
-
         for i in range(n_mlp):
             layers.append(
                 EqualLinear(
                     style_dim, style_dim, lr_mul=lr_mlp, activation="fused_lrelu"
                 )
             )
+
         """
         style 将输入b in_dim -> b in_dim 线性或非线性映射(存在激活函数)，dim一般=512
         
         """
         self.style = nn.Sequential(*layers)
+
+
 
         self.channels = {
             4: 512,
@@ -477,12 +482,15 @@ class Generator(nn.Module):
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
         }
-        """ 初始化输入
-           self.channels[4]=512,初始化得到(1,512,4,4)
-           第一维度 repeat batch次 变成(b,512,4,4) 
 
+
+        """ 
+        初始化输入
+        self.channels[4]=512,初始化得到(1,512,4,4)
+        第一维度 repeat batch次 变成(b,512,4,4) 
         """
         self.input = ConstantInput(self.channels[4])
+
 
         """
         开始设置卷积了，在外部当作普通卷积理解，具体理解可见具体函数
@@ -491,6 +499,7 @@ class Generator(nn.Module):
         self.conv1 = StyledConv(
             self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
         )
+
         """
         先当作普通卷积，从512通道卷积到3通道(RGB)
         b,512,4,4 -> b,3,4,4
@@ -499,8 +508,9 @@ class Generator(nn.Module):
 
         # 2^n 次方，如果是512，logsize就是9
         self.log_size = int(math.log(size, 2))
+
         """
-        # 层数根据logsize来设置如果是512，那么就是(9-2)*2+1 = 15 层，
+        层数根据logsize来设置如果是512，那么就是(9-2)*2+1 = 15 层，
         初始尺寸4，是2^2 ，最终尺寸是2^9，除去第一个尺寸的一个卷积，其他每个尺寸都有两个卷积=(9-2)*2+1
         """
         self.num_layers = (self.log_size - 2) * 2 + 1
@@ -512,6 +522,7 @@ class Generator(nn.Module):
 
         in_channel = self.channels[4]
 
+
         """
         为啥+5？ 与每个尺寸的操作对应，第一个卷积只有一个，噪声也只有一个，都是在尺寸4上进行
         从第二个卷积开始，每个卷积都有两个，噪声也有两个，+5可以保证下一个偶数噪声和下下个奇数噪声尺寸相同。
@@ -521,6 +532,7 @@ class Generator(nn.Module):
             shape = [1, 1, 2 ** res, 2 ** res]
             self.noises.register_buffer(f"noise_{layer_idx}", torch.randn(*shape))
 
+        
         """
         range从3开始到logsize+1，这个主要还是要和out_channel一一对应
         第一个卷积输入时self.channels[2 ** 2] = self.channels[4] 
@@ -552,9 +564,8 @@ class Generator(nn.Module):
             in_channel = out_channel
 
         """
-        #
-        #   self.n_latent 表示lantent 隐码有几个，是2x9-2=16个
-         也就是总的2^9 ，每个维度有两个lantent但是2，没有，所以-2
+        self.n_latent 表示lantent 隐码有几个，是2x9-2=16个
+        也就是总的2^9 ，每个维度有两个lantent但是2，没有，所以-2
         """
         self.n_latent = self.log_size * 2 - 2
 

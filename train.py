@@ -189,7 +189,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, _ = generator(noise) #生成假图
 
-
+        # 后面的内容，不是stylegan2的内容，先不看
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
             fake_img, _ = augment(fake_img, ada_aug_p)
@@ -247,7 +247,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
-        # 鉴别器给的 loss,非饱和loss？其实就是gan loss
+        # 鉴别器结果，gan loss(softplus loss)
         fake_pred = discriminator(fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
 
